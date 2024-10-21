@@ -1,0 +1,229 @@
+---
+title: "Proteomic_Suite"
+author: "Fabiola Iommazzo"
+date: "2024-10-18"
+output: html_document
+---
+
+This script describes a general pipeline for the analysis of proteomics dataset -output MaxQuant- derived from global proteomics and AP-MS experiments.
+Create a folder where you put this script, the Functions.R and the proteinGroups.txt file.
+
+Set working directory to Source File: Session --> Set Working Directory --> To Source File Location
+
+Load required libraries and the source file for general functions
+```{r}
+library(tidyverse)
+library(readr)
+library(corrplot)
+library(psych)
+library(edgeR)
+library(RColorBrewer)
+
+source("./Functions.R")
+```
+
+
+Load proteinGroups
+```{r}
+file = "path_to_file/file.txt" #path to proteinGroups.txt
+
+proteinGroups <- read_proteinGroups(file)
+head(proteinGroups)
+```
+
+
+Apply standard filters:
+- remove contaminants (reverse, potential contaminants, only identified by site)
+- keep proteins identified with at least 1 unique peptide
+- keep only necessary columns
+
+```{r}
+# check number of contaminats to remove them
+sprintf("The number of contaminants are %d + %d + %d", 
+      table(is.na(proteinGroups$`Only identified by site`))[1],
+      table(is.na(proteinGroups$Reverse))[1],
+      table(is.na(proteinGroups$`Potential contaminant`))[1])
+
+sprintf("The number of proteins with at least on unique peptide is %d", 
+        table(proteinGroups$`Unique peptides` >= 1)[1])
+
+
+clean_proteinGroups <- filtering(proteinGroups)
+anno_tab <- annotation_table(proteinGroups)
+```
+
+
+Convert LFQ values in Log2 values --> better to do the analysis
+
+```{r}
+LFQ_tab <- clean_proteinGroups |>
+  mutate(across(starts_with("LFQ"), log2)) |>
+  mutate(across(starts_with ("LFQ"), ~ na_if(., -Inf)))
+```
+
+
+Start QC:
+We want to verify:
+- the number of total identified protein per condition. It is a parameter to visualize if some conditions/replicates should be removed.
+- the distibution of log2LFQ values: Max quant apply the LFQ normalization, indeed LFQ values of the different conditions/replicates must be aligned around the median. Otherwise the normalization has failed.
+- correlation among and across conditions. Replicates from the same condition should have good correlation.
+- pca to cluster samples
+
+```{r}
+barplot(apply(LFQ_tab[-1],2,function(x) !is.na(x)), las = 2) #number of proteins per sample
+
+LFQ_tab |>
+  column_to_rownames("Protein_Gene") |>
+  boxplot(outline = F, las = 2) #boxplot to see distribution is centered around the median for all samples.
+
+LFQ_tab |>
+  column_to_rownames("Protein_Gene") |>
+  cor(use = "na.or.complete") |>
+  corrplot(method = "square", addCoef.col = T) #correlation among replicates and across conditions
+
+pairs.panels(LFQ_tab[,-1], 
+             method = "pearson", # correlation method
+             hist.col = "#00AFBB",
+             density = TRUE,  # show density plots
+             ellipses = TRUE # show correlation ellipses
+) #summary ploy with correlations and histograms of intensities
+
+
+colCondition <- c(rep("lightblue",2), rep("violet",4),
+                  rep("orange",4), rep("green",4)) #select colors for pca according to the number of replicates
+plotMDS(LFQ_tab[,-1], pch = 16, col = colCondition)
+```
+
+
+Writing tables...
+
+```{r}
+#remove unnecessary objects prior to subsequent analysis (save space in R)
+rm(clean_proteinGroups, proteinGroups, colCondition, file)
+
+
+write.csv(LFQ_tab,"./Filtered_proteinGroups.csv", row.names = F)
+write.csv(anno_tab,"./Annotation_proteinGroups.csv", row.names = F)
+
+```
+
+~~~~~~~~~~~~~~~~~~~~~~~~
+########################
+MISSING VALUE IMPUTATION
+########################
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+The first thing to do is to filter out rows without enough number of valid replicates. Generally you can do it in "at least on condition" or "on total". In both cases you can decide to retain 50% of valid values or 75% to be more stringent.
+
+```{r}
+# From the QC you can visualize which colums is better to remove prior to procede with the statistical analysis
+LFQ_tab <- LFQ_tab |>
+  dplyr::select(-LFQ_P1_dRING_04)
+
+# Count number of valid values per condition
+LFQ_tab <-LFQ_tab |>
+  rowwise() |> 
+  mutate(count_tot = sum(!is.na(c_across(LFQ_E14_01:LFQ_P1_FL_04))), #specify the replicates per condition (modify accordingly)
+         count_Cond1 = sum(!is.na(c_across(LFQ_E14_01:LFQ_E14_02))),
+         count_Cond2 = sum(!is.na(c_across(LFQ_P1_dRING_01:LFQ_P1_dRING_03))),
+         count_Cond3 = sum(!is.na(c_across(LFQ_P1_dRW_01:LFQ_P1_dRW_04))),
+         count_Cond4 = sum(!is.na(c_across(LFQ_P1_FL_01:LFQ_P1_FL_04)))) |>
+  ungroup()
+
+
+# if you want to filter "on total" use this
+filtered_table <- LFQ_tab |>
+  filter(count_tot >= 5) |>
+  select(-contains("count"))
+
+# if you want to filter in "at least one" use this and modify accordingly
+filtered_table <- LFQ_tab[(LFQ_tab['count_Cond1'] >=1) |
+                           (LFQ_tab['count_Cond2'] >= 2) |
+                           (LFQ_tab['count_Cond3'] >= 2) |
+                           (LFQ_tab['count_Cond5'] >=2),]
+
+filtered_table <- filtered_table |> dplyr::select(-contains("count"))
+```
+
+
+
+Missing values can be missed for several reasons:(i) they do not exists, (ii) missing at random, (iii) too low to be detected.
+For the case (i) and (iii) it is better to impute them with a low number, generally derived by the LFQ distribution. For the case (ii) we assume the missing value is close to the intensity of those identified in the other replicates, indeed it can be approximated to their average.
+
+Type of imputation available here:
+1. replace with 0 all the missing values
+2. replace with mean
+3. replace all the missing values with the minimum value of the distribution
+4. MIXED IMPUTATION: it replace the missing values in two way. You can use the average of the other replicates; or you can extract ta value from a distribution generated by shifting the real distribution --> the parameter of this new distribution will be mean=µ-(1.8*∂) and sd=0.3 * ∂. This depends on the number of valid values per condition. If you have more than 50% of valid value you will replace the missing with the average of the other two. If you have o or less than 50% of replicate we can assume this value is missing because low detection or absence in the sample, so it is better to impute it with a number from the aforementionated distribution.
+
+```{r}
+imputation_NA_0 <- imputation(filtered_table, "zero") #impute with 0
+# write.csv (imputation_NA_0, "./Imputation_NA_0.csv")
+
+imputation_NA_min <- imputation(filtered_table, "min") #impute with minimum
+# write.csv (imputation_NA_min,"./Imputation_NA_min_value_table.csv")
+
+imputation_NA_mean <- imputation(filtered_table, "mean") #impute with mean
+# write.csv (imputation_NA_min,"./Imputation_NA_mean_value_table.csv")
+
+
+
+
+# MIXED IMPUTATION
+# Define multiple condition sets and control sets
+condition_sets <- list(
+  c("LFQ_P1_FL_01", "LFQ_P1_FL_02", "LFQ_P1_FL_03", "LFQ_P1_FL_04"),
+  c("LFQ_P1_dRING_01", "LFQ_P1_dRING_02", "LFQ_P1_dRING_03"),
+  c("LFQ_P1_dRW_01", "LFQ_P1_dRW_02", "LFQ_P1_dRW_03", "LFQ_P1_dRW_04")
+  #c("LFQ_P2_dT_01", "LFQ_P2_dT_02", "LFQ_P2_dT_03", "LFQ_P2_dT_04")
+)
+
+control_sets <- list(
+  c("LFQ_E14_01", "LFQ_E14_02")
+)
+
+# Define missing value thresholds for each condition and control group
+missing_thresholds <- list(
+  cond = c(2, 2, 1),  # Threshold for condition 1, 2, 3
+  ctrl = c(2)   # Threshold for control 1
+)
+
+mixed_imp <- mixed_imputation(filtered_table, condition_sets, control_sets, missing_thresholds)
+# write.csv (mixed_imp,"./Mixed_Imputation_Table.csv", row.names = T)
+```
+
+
+~~~~~~~~~~~~~~~~~~~~~~~~
+########################
+  STATISTICAL ANALYSIS
+########################
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+```{r}
+fit <- diff_expr_analysis(mixed_imp)
+contr <- makeContrasts(CondvsCtrl =  groupProtein.P1_dRW - groupProtein.E14,
+                       levels = colnames(coef(fit))) #specify conditions to test
+tmp <- contrasts.fit(fit, contr[,"CondvsCtrl"]) |>
+  eBayes() 
+
+stat_table <- topTable(tmp, sort.by = "P", n = Inf) |>
+  rownames_to_column("Protein")
+
+#write statistical table
+stat_table |>
+  dplyr::select(-AveExpr, -t, -B) |>
+  write.csv ("./Table_Statistics.csv", row.names = F)
+```
+
+Vulcano plot:
+
+```{r}
+generate_vulcano(stat_table, 
+                 is_IP = T, #put T if your dataset comes from an AP-MS, put F if your dataset is a standard proteomics
+                 is_stringent = T, #put T if you want a stringent significance (p.adj), put F if you want relax (p.value)
+                 p_adj_cutoff = 0.05, 
+                 p_value_cutoff = 0.05, 
+                 lfc_cutoff = 1)
+```
+
+
